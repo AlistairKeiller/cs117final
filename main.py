@@ -53,6 +53,13 @@ def k_cast(
     err = dx - dy
     x = x0
     y = y0
+    e2 = 2 * err
+    if e2 > -dy:
+        err -= dy
+        x += sx
+    if e2 < dx:
+        err += dx
+        y += sy
     for _ in range(dx + dy):
         if x == x1 and y == y1:
             break
@@ -128,13 +135,18 @@ def k_csm(
     scores[it, iy, ix] = acc / wp.float(n)
 
 
-@wp.kernel
-def k_max_pool_2x2(src: wp.array2d[wp.float], dst: wp.array2d[wp.float]):
+def k_pyramid_step(
+    src: wp.array2d[wp.float],
+    dst: wp.array2d[wp.float],
+    offset: wp.int,
+    H: wp.int,
+    W: wp.int,
+):
     i, j = wp.tid()
-    a = src[2 * i, 2 * j]
-    b = src[2 * i, 2 * j + 1]
-    c = src[2 * i + 1, 2 * j]
-    d = src[2 * i + 1, 2 * j + 1]
+    a = src[i, j]
+    b = src[i + offset, j] if i + offset < H else 0.0
+    c = src[i, j + offset] if j + offset < W else 0.0
+    d = src[i + offset, j + offset] if i + offset < H and j + offset < W else 0.0
     m = wp.max(a, b)
     m = wp.max(m, c)
     m = wp.max(m, d)
@@ -147,7 +159,7 @@ def k_bbs_score(
     grid: wp.array2d[wp.float],
     gx: float,
     gy: float,
-    level_res: float,
+    res: float,
     H: int,
     W: int,
     cands: wp.array[wp.vec3f],
@@ -165,8 +177,8 @@ def k_bbs_score(
         p = pts[i]
         wx = cx + c * p[0] - s * p[1]
         wy = cy + s * p[0] + c * p[1]
-        ix = wp.int((wx - gx) / level_res)
-        iy = wp.int((wy - gy) / level_res)
+        ix = wp.int((wx - gx) / res)
+        iy = wp.int((wy - gy) / res)
         if ix >= 0 and ix < W and iy >= 0 and iy < H:
             acc += grid[iy, ix]
     scores[k] = acc / wp.float(n)

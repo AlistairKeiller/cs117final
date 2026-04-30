@@ -1,12 +1,34 @@
 """
 Cartographer-style 2D graph SLAM for F1Tenth.
-Front-end (GPU/Warp): ray-casting, CSM, refinement-cost evaluation, BBS pyramids.
+Front-end (GPU/Warp): ray-casting, optional CSM, refinement-cost evaluation, BBS pyramids.
 Back-end (CPU/GTSAM): pose graph with intra-submap and loop-closure edges, LM optimization.
+
+Closely follows Hess et al. "Real-Time Loop Closure in 2D LIDAR SLAM" (ICRA 2016) and
+the cartographer-project source. Notable choices (see component docstrings for details):
+
+  * BBS uses Cartographer's same-resolution sliding-window-max precomputed grids
+    (paper Eq. 17). M_h has the same shape as M_0; each cell stores max over
+    [i, i+2^h) x [j, j+2^h). This makes the upper bound EXACT for arbitrarily
+    positioned candidates -- no coarse-grid alignment required.
+  * BBS angular step is derived from the paper's Eq. 7:
+        dtheta = arccos(1 - r^2 / (2 * d_max^2))
+    so scan points at d_max move by <= one cell per angular step.
+  * LC refinement does NOT regularize toward odometry (the LC observation should
+    override drift); only the smooth-grid scan-match cost is minimized.
+  * Each submap receives 2 * NUM_RANGE_DATA scans, matching Cartographer 2D's
+    "old + new" rotation: a submap is the "new" one for NUM_RANGE_DATA scans,
+    then the "old matching target" for another NUM_RANGE_DATA scans, then frozen.
+  * Loop-closure search runs over a window of recent nodes, not just the current
+    one, and is retried after each global optimization (poses change -> gating
+    decisions change). This approximates Cartographer's background dispatch.
+  * Refinement uses bicubic-spline interpolation on the probability grid
+    (paper IV-C). Out-of-grid samples return 0.5 (no information; neutral).
 """
 
 import gtsam
 import numpy as np
 import warp as wp
+from scipy.ndimage import map_coordinates, spline_filter
 from scipy.optimize import least_squares
 
 wp.init()
@@ -15,38 +37,42 @@ DEV = "cuda" if wp.is_cuda_available() else "cpu"
 # =============================================================================
 # Configuration
 # =============================================================================
+# Resolution and grid
 RES = 0.05  # m / cell
 L_HIT, L_MISS = 0.85, -0.40
 L_MIN, L_MAX = -2.2, 2.2
 GRID_HW = 400  # 20m x 20m submap
-SUBMAP_N = 90  # scans before submap finalizes
 
-# CSM
-WIN_XY, STEP_XY = 0.15, 0.025
-WIN_TH, STEP_TH = 0.17, 0.005
+# Submap budget (Cartographer 2D: 2 * num_range_data)
+NUM_RANGE_DATA = 90
+SUBMAP_TOTAL_SCANS = 2 * NUM_RANGE_DATA  # 180
 
-# Refinement
+# Local scan matching
+USE_CSM = False  # off by default; enable if odometry is unreliable
+CSM_WIN_XY, CSM_STEP_XY = 0.15, 0.025
+CSM_WIN_TH, CSM_STEP_TH = 0.17, 0.005
+CSM_MIN_SCORE = 0.30  # below this, fall back to odometry-only init for refinement
 REFINE_ITERS = 20
 REFINE_W_T = 10.0
 REFINE_W_R = 40.0
 
-# BBS
-BBS_LEVELS = 6  # pyramid depth
-BBS_WIN_XY = 7.0
-BBS_WIN_TH = np.pi
-BBS_STEP_TH = 0.02  # angular candidates spacing
+# BBS / loop closure
+BBS_LEVELS = 6  # precomputed grid levels (covers 2^5 = 32 cells = 1.6m windowing)
 LC_MIN_SCORE = 0.55
+LC_WIN_XY = 2.0  # m, half-window for local LC search
+LC_WIN_TH = 0.5  # rad, half-window for local LC search
+LC_MAX_DISTANCE = 15.0  # m, spatial gating
 
 # Pose graph noise (sigmas)
 SIGMA_INTRA = np.array([0.025, 0.025, 0.005])
 SIGMA_LC = np.array([0.05, 0.05, 0.02])
 SIGMA_PRIOR = np.array([1e-6, 1e-6, 1e-8])
-SIGMA_ODOM = np.array([0.1, 0.1, 0.05])  # fallback when matcher fails
 HUBER_K = 1.0
 
-# Scheduling
-LC_SKIP_NODES = 50
+# Loop-closure scheduling
 OPTIMIZE_EVERY = 30
+LC_SKIP_NODES = 50  # don't try LC on the very first nodes
+LC_RECENT_WINDOW = 50  # how many recent nodes to try in each LC sweep
 
 
 # =============================================================================
@@ -96,10 +122,11 @@ def k_cast(
     H: int,
     W: int,
 ):
-    """Bresenham ray-cast: subtract lmiss along the ray, add lhit at endpoint.
+    """Bresenham ray-cast: subtract lmiss along the ray (excluding the sensor cell),
+    add lhit at the endpoint. Atomic adds let many rays update the same cell safely.
 
-    Math: Bresenham picks integer cell trajectory minimizing distance from
-    continuous ray. Atomic adds let many rays update the same cell safely.
+    The pre-step before the loop ensures we start applying lmiss at the cell after
+    the sensor, matching the paper's "between origin and scan point" convention.
     """
     i = wp.tid()
     p = pts[i]
@@ -120,6 +147,16 @@ def k_cast(
     err = dx - dy
     x = x0
     y = y0
+
+    # Pre-step once so the loop body never touches the sensor's own cell.
+    e2 = 2 * err
+    if e2 > -dy:
+        err -= dy
+        x += sx
+    if e2 < dx:
+        err += dx
+        y += sy
+
     for _ in range(dx + dy):
         if x == x1 and y == y1:
             break
@@ -132,6 +169,7 @@ def k_cast(
         if e2 < dx:
             err += dx
             y += sy
+
     if x1 >= 0 and x1 < W and y1 >= 0 and y1 < H:
         wp.atomic_add(grid, y1, x1, lhit)
 
@@ -175,15 +213,9 @@ def k_csm(
     sth: float,
     scores: wp.array3d(dtype=wp.float32),
 ):
-    """Score every (dtheta, dy, dx) candidate around prior. One thread per candidate.
-
-    Math per thread:
-      1. candidate = prior + (dx, dy, dtheta)
-      2. for each scan point p_k (sensor frame):
-           world = candidate.translation + R(candidate.theta) @ p_k
-           sample probability grid bilinearly (with HALF-CELL OFFSET)
-           sum into accumulator
-      3. score = sum / N (normalize for cross-scan comparability)
+    """Score every (dtheta, dy, dx) candidate around prior with bilinear-interp
+    probability. One thread per candidate. Half-cell offset because cell values
+    are stored at the cell CENTER for interpolation.
     """
     it, iy, ix = wp.tid()
     dth = (float(it) - float(nth) / 2.0) * sth
@@ -200,7 +232,6 @@ def k_csm(
         p = pts[k]
         wx = cx + c * p[0] - s * p[1]
         wy = cy + s * p[0] + c * p[1]
-        # half-cell offset: cell value sits at the cell CENTER
         fx = (wx - gx) / res - 0.5
         fy = (wy - gy) / res - 0.5
         x0 = int(wp.floor(fx))
@@ -216,20 +247,36 @@ def k_csm(
 
 
 @wp.kernel
-def k_max_pool_2x2(
-    src: wp.array2d(dtype=wp.float32), dst: wp.array2d(dtype=wp.float32)
+def k_pyramid_step(
+    src: wp.array2d(dtype=wp.float32),  # M_{h-1}
+    dst: wp.array2d(dtype=wp.float32),  # M_h
+    offset: int,  # 2^(h-1)
+    H: int,
+    W: int,
 ):
-    """Pyramid level: dst[i,j] = max of src[2i:2i+2, 2j:2j+2].
+    """Cartographer's same-resolution precomputation grid (paper Section V-B.3, Eq. 17).
 
-    Why max (not average): BBS needs the coarse-level value to be an UPPER
-    BOUND on every fine-level value it covers. Max preserves this; average
-    doesn't. The upper-bound property is what justifies pruning in BBS.
+    M_h[i, j] = max over [i, i+2^h) x [j, j+2^h) of M_0
+              = max(M_{h-1}[i, j],
+                    M_{h-1}[i+offset, j],
+                    M_{h-1}[i, j+offset],
+                    M_{h-1}[i+offset, j+offset])
+    where offset = 2^{h-1}. Out-of-bounds reads return 0 (no contribution).
+
+    Output has the SAME shape as M_0 -- this is what makes the BBS upper bound
+    exact for arbitrary candidate positions.
     """
     i, j = wp.tid()
-    a = src[2 * i, 2 * j]
-    b = src[2 * i, 2 * j + 1]
-    c = src[2 * i + 1, 2 * j]
-    d = src[2 * i + 1, 2 * j + 1]
+    a = src[i, j]
+    b = float(0.0)
+    c = float(0.0)
+    d = float(0.0)
+    if i + offset < H:
+        b = src[i + offset, j]
+    if j + offset < W:
+        c = src[i, j + offset]
+    if i + offset < H and j + offset < W:
+        d = src[i + offset, j + offset]
     m = a
     if b > m:
         m = b
@@ -246,16 +293,16 @@ def k_bbs_score(
     grid: wp.array2d(dtype=wp.float32),
     gx: float,
     gy: float,
-    level_res: float,
+    res: float,
     H: int,
     W: int,
     cands: wp.array(dtype=wp.vec3),
     scores: wp.array(dtype=wp.float32),
 ):
-    """Score a batch of candidate (x, y, theta) poses against a pyramid level.
-    Same scoring math as k_csm but with arbitrary candidate list.
-    No half-cell offset here -- BBS uses cell-center sampling at the level's
-    resolution, where the upper-bound property holds via direct cell lookup.
+    """Score (x, y, theta) candidates against a precomputed grid.
+
+    Same indexing as M_0 (no level-dependent stride): the precomputed grid
+    handles spatial windowing internally via the sliding-window max.
     """
     k = wp.tid()
     cand = cands[k]
@@ -270,23 +317,29 @@ def k_bbs_score(
         p = pts[i]
         wx = cx + c * p[0] - s * p[1]
         wy = cy + s * p[0] + c * p[1]
-        ix = int((wx - gx) / level_res)
-        iy = int((wy - gy) / level_res)
+        ix = int((wx - gx) / res)
+        iy = int((wy - gy) / res)
         if ix >= 0 and ix < W and iy >= 0 and iy < H:
             acc += grid[iy, ix]
     scores[k] = acc / float(n)
 
 
 # =============================================================================
-# Submap: log-odds grid + probability grid + (when finalized) pyramid
+# Submap: log-odds grid + probability grid + (when finalized) precomputed grids
 # =============================================================================
 class Submap:
     """A 2D occupancy submap.
 
-    Origin is the world pose at submap creation. The grid is in *submap-local*
-    coordinates: cell (0,0) sits at submap-local (-W*r/2, -H*r/2). When the
+    Origin is the world pose at submap creation. The grid is in submap-LOCAL
+    coordinates: cell (0, 0) sits at submap-local (-W*r/2, -H*r/2). When the
     submap origin moves due to global optimization, the grid contents stay
     fixed in submap-local coords -- only the origin pose moves in the world.
+
+    Lifecycle:
+      * Active: log-odds grid is updated as scans arrive; prob grid is rebuilt
+        on demand for matching.
+      * Finalized: log-odds is no longer mutated. The BBS precomputed grid stack
+        is built once. The log-odds buffer is freed.
     """
 
     _next_id = 0
@@ -295,30 +348,26 @@ class Submap:
         self.id = Submap._next_id
         Submap._next_id += 1
         self.origin = origin_pose.copy()
-        # local grid spans [-W*r/2, W*r/2] x [-H*r/2, H*r/2]
         self.gx = -GRID_HW * RES / 2.0
         self.gy = -GRID_HW * RES / 2.0
         self.log = wp.zeros((GRID_HW, GRID_HW), dtype=wp.float32, device=DEV)
         self.prob = wp.zeros_like(self.log)
-        self.pyramid = []  # built at finalize()
-        self.scans = []  # list of (sensor_pose_world, scan_local) for LC
+        self.precomp = []  # list of precomputed grids; precomp[0] aliases self.prob
+        self.scans = []
         self.n = 0
         self.finalized = False
         self._prob_dirty = True
 
     def insert(self, sensor_pose_world, scan_local):
-        """Insert a scan, recording it for later (LC) and rasterizing into the grid.
-
-        sensor_pose_world: SE(2) pose of sensor in WORLD frame.
-        scan_local: Nx2 endpoints in SENSOR frame.
-        Internally we transform scan to submap-local frame for rasterization.
-        """
+        """Insert a scan into the submap at the given world sensor pose."""
         if self.finalized:
             raise RuntimeError("Cannot insert into a finalized submap")
+        if len(scan_local) == 0:
+            return
 
-        # 1. sensor pose in submap-local frame
+        # Sensor pose in submap-local frame
         sensor_local = between(self.origin, sensor_pose_world)
-        # 2. scan in submap-local frame: rotate by sensor_local.theta, translate by sensor_local.xy
+        # Scan in submap-local frame: rotate by sensor_local.theta, then translate
         c, s = np.cos(sensor_local[2]), np.sin(sensor_local[2])
         R = np.array([[c, -s], [s, c]])
         scan_submap = scan_local @ R.T + sensor_local[:2]
@@ -350,7 +399,7 @@ class Submap:
         self._prob_dirty = True
 
     def refresh_prob(self):
-        """Rebuild self.prob from self.log if dirty."""
+        """Rebuild self.prob from self.log if dirty (no-op for finalized submaps)."""
         if self._prob_dirty:
             wp.launch(
                 k_logodds_to_prob,
@@ -361,41 +410,48 @@ class Submap:
             self._prob_dirty = False
 
     def finalize(self):
-        """Build the multi-resolution max-pool pyramid for BBS."""
+        """Build the same-resolution precomputed grid stack for BBS.
+
+        precomp[0] = M_0 (probability grid, aliases self.prob)
+        precomp[h] = sliding-window max with window size 2^h, same resolution as M_0
+        """
         if self.finalized:
             return
         self.refresh_prob()
-        self.pyramid = [self.prob]
-        for lvl in range(1, BBS_LEVELS):
-            prev = self.pyramid[-1]
-            ph, pw = prev.shape[0] // 2, prev.shape[1] // 2
-            nxt = wp.zeros((ph, pw), dtype=wp.float32, device=DEV)
-            wp.launch(k_max_pool_2x2, dim=(ph, pw), inputs=[prev, nxt], device=DEV)
-            self.pyramid.append(nxt)
+        self.precomp = [self.prob]
+        for h in range(1, BBS_LEVELS):
+            prev = self.precomp[-1]
+            offset = 2 ** (h - 1)
+            nxt = wp.zeros((GRID_HW, GRID_HW), dtype=wp.float32, device=DEV)
+            wp.launch(
+                k_pyramid_step,
+                dim=(GRID_HW, GRID_HW),
+                inputs=[prev, nxt, offset, GRID_HW, GRID_HW],
+                device=DEV,
+            )
+            self.precomp.append(nxt)
         self.finalized = True
+        # Log-odds buffer is no longer needed
+        self.log = None
 
 
 # =============================================================================
-# Correlative Scan Matcher (CSM): coarse pose recovery via brute-force search
+# Correlative Scan Matcher (CSM): brute-force 3D search over (dx, dy, dtheta).
+# Optional - off by default. Use as a more robust prior when odometry is noisy.
 # =============================================================================
 def csm(submap, prior_local, scan_local):
-    """Match a scan against a submap's probability grid.
-
-    Inputs:
-      submap: target submap (its prob grid will be refreshed)
-      prior_local: SE(2) prior in submap-LOCAL frame (3,)
-      scan_local: Nx2 scan in sensor frame
-    Outputs:
-      (best_pose_local, best_score) -- pose in submap-local frame
+    """Match a scan against a submap's probability grid via brute-force search.
+    Returns (best_pose_local, best_score) in submap-local frame.
     """
+    if len(scan_local) == 0:
+        return prior_local.copy(), 0.0
     submap.refresh_prob()
-    nx = int(2 * WIN_XY / STEP_XY) + 1
+    nx = int(2 * CSM_WIN_XY / CSM_STEP_XY) + 1
     ny = nx
-    nth = int(2 * WIN_TH / STEP_TH) + 1
+    nth = int(2 * CSM_WIN_TH / CSM_STEP_TH) + 1
 
     pts = wp.array(scan_local, dtype=wp.vec2, device=DEV)
     scores = wp.zeros((nth, ny, nx), dtype=wp.float32, device=DEV)
-
     wp.launch(
         k_csm,
         dim=(nth, ny, nx),
@@ -413,18 +469,17 @@ def csm(submap, prior_local, scan_local):
             nx,
             ny,
             nth,
-            STEP_XY,
-            STEP_TH,
+            CSM_STEP_XY,
+            CSM_STEP_TH,
             scores,
         ],
         device=DEV,
     )
-
     s = scores.numpy()
     it, iy, ix = np.unravel_index(int(np.argmax(s)), s.shape)
-    dth = (it - nth // 2) * STEP_TH
-    dx = (ix - nx // 2) * STEP_XY
-    dy = (iy - ny // 2) * STEP_XY
+    dth = (it - nth // 2) * CSM_STEP_TH
+    dx = (ix - nx // 2) * CSM_STEP_XY
+    dy = (iy - ny // 2) * CSM_STEP_XY
     best = np.array(
         [prior_local[0] + dx, prior_local[1] + dy, wrap(prior_local[2] + dth)]
     )
@@ -432,56 +487,73 @@ def csm(submap, prior_local, scan_local):
 
 
 # =============================================================================
-# Ceres-style refinement: post-CSM polish to sub-grid accuracy
+# Ceres-style refinement on a smooth probability grid (paper Eq. CS).
+# Bicubic-spline interpolation gives sub-cell accuracy with continuous gradients.
 # =============================================================================
-def refine(submap, csm_pose_local, prior_local, scan_local):
-    """Nonlinear least-squares pose refinement on a smooth interpolated grid.
+def _make_sample_fn(submap):
+    """Return a function f(world_xy_Nx2) -> probability_N using bicubic interpolation.
 
-    Cost = sum_k (1 - M_smooth(T . p_k))^2
+    Out-of-grid points return 0.5 (neutral; no information). The spline-prefiltered
+    grid is computed once per refine() call and reused across LM iterations.
+    """
+    submap.refresh_prob()
+    prob = submap.prob.numpy()
+    # Pre-filter once; map_coordinates can then use prefilter=False for speed.
+    filtered = spline_filter(prob, order=3, mode="constant")
+
+    def sample(world_xy):
+        # Cell-center pixel coordinates (with -0.5 offset)
+        fx = (world_xy[:, 0] - submap.gx) / RES - 0.5
+        fy = (world_xy[:, 1] - submap.gy) / RES - 0.5
+        coords = np.vstack([fy, fx])  # map_coordinates wants (row, col)
+        return map_coordinates(
+            filtered, coords, order=3, mode="constant", cval=0.5, prefilter=False
+        )
+
+    return sample
+
+
+def refine_local(submap, init_pose_local, prior_local, scan_local):
+    """Local-SLAM refinement: bicubic-spline cost + odometry-prior regularization.
+
+    Cost = sum_k (1 - M_smooth(T h_k))^2
          + (W_T * (T.x - prior.x))^2 + (W_T * (T.y - prior.y))^2
          + (W_R * wrap(T.theta - prior.theta))^2
 
-    Solved by Levenberg-Marquardt (scipy). Initialized at csm_pose_local.
-    Operates entirely in submap-local frame.
+    The odometry prior keeps the solution near the extrapolated pose, which is
+    appropriate when the matcher has weak signal (e.g. featureless corridors).
     """
-    submap.refresh_prob()
-    prob = submap.prob.numpy()  # one host copy; reused across LM iterations
+    return _refine(submap, init_pose_local, scan_local, prior_local=prior_local)
 
-    def sample(world_xy):
-        """Bilinear-interpolated probability at (x, y) in submap-local frame.
-        Returns 0 outside the grid (treat as "no information")."""
-        fx = (world_xy[:, 0] - submap.gx) / RES - 0.5
-        fy = (world_xy[:, 1] - submap.gy) / RES - 0.5
-        x0 = np.floor(fx).astype(int)
-        y0 = np.floor(fy).astype(int)
-        tx = fx - x0
-        ty = fy - y0
-        ok = (x0 >= 0) & (x0 + 1 < GRID_HW) & (y0 >= 0) & (y0 + 1 < GRID_HW)
-        v = np.zeros_like(fx)
-        if ok.any():
-            xs0, ys0 = x0[ok], y0[ok]
-            tx_, ty_ = tx[ok], ty[ok]
-            v[ok] = (prob[ys0, xs0] * (1 - tx_) + prob[ys0, xs0 + 1] * tx_) * (
-                1 - ty_
-            ) + (prob[ys0 + 1, xs0] * (1 - tx_) + prob[ys0 + 1, xs0 + 1] * tx_) * ty_
-        return v
+
+def refine_lc(submap, init_pose_local, scan_local):
+    """Loop-closure refinement: NO odometry prior. The LC observation must be
+    free to override drifted odometry.
+    """
+    return _refine(submap, init_pose_local, scan_local, prior_local=None)
+
+
+def _refine(submap, init_pose_local, scan_local, prior_local):
+    """LM refinement. If prior_local is None, no prior regularizer is applied."""
+    if len(scan_local) == 0:
+        return init_pose_local.copy()
+    sample = _make_sample_fn(submap)
 
     def residuals(T):
         c, s = np.cos(T[2]), np.sin(T[2])
-        # transform each scan point to submap-local
         wx = T[0] + c * scan_local[:, 0] - s * scan_local[:, 1]
         wy = T[1] + s * scan_local[:, 0] + c * scan_local[:, 1]
         m = sample(np.column_stack([wx, wy]))
-        # per-point residual: 1 - probability
         rp = 1.0 - m
-        # prior residuals
+        if prior_local is None:
+            return rp
         rt_x = REFINE_W_T * (T[0] - prior_local[0])
         rt_y = REFINE_W_T * (T[1] - prior_local[1])
         rr = REFINE_W_R * wrap(T[2] - prior_local[2])
         return np.concatenate([rp, [rt_x, rt_y, rr]])
 
     res = least_squares(
-        residuals, csm_pose_local.copy(), method="lm", max_nfev=REFINE_ITERS * 4
+        residuals, init_pose_local.copy(), method="lm", max_nfev=REFINE_ITERS * 4
     )
     out = res.x.copy()
     out[2] = wrap(out[2])
@@ -489,130 +561,115 @@ def refine(submap, csm_pose_local, prior_local, scan_local):
 
 
 # =============================================================================
-# Branch-and-Bound Search (BBS) for loop-closure
+# Branch-and-Bound Search (BBS) for loop closure
 # =============================================================================
-def _score_at_level(submap, level_idx, scan_local, candidates):
-    """Score a list of (x, y, theta) candidates at a given pyramid level.
+def _angular_step(scan_local, res):
+    """Paper Eq. 7: dtheta such that scan points at d_max move <= one cell.
 
-    Returns scores as numpy array, length len(candidates).
+        dtheta = arccos(1 - r^2 / (2 * d_max^2))
+
+    With this step, the spatial precomputed grid for each angle gives an
+    exact upper bound for BBS.
     """
-    grid = submap.pyramid[level_idx]
-    H, W = grid.shape
-    # cell size at this level: a level-l cell covers 2^l native cells
-    level_res = RES * (2**level_idx)
-    # gx, gy of the level grid: same world origin, but level grid covers same
-    # world extent in fewer larger cells, so origin is the same
-    gx, gy = submap.gx, submap.gy
+    if len(scan_local) == 0:
+        return 0.01
+    d_max = float(np.linalg.norm(scan_local, axis=1).max())
+    if d_max < 2 * res:
+        return 0.1
+    cos_arg = max(-1.0, 1.0 - res * res / (2.0 * d_max * d_max))
+    return float(np.arccos(cos_arg))
 
+
+def _score_at_level(submap, level_idx, scan_local, candidates):
+    """Score (x, y, theta) candidates against the precomputed grid at `level_idx`."""
+    grid = submap.precomp[level_idx]
+    H, W = grid.shape
     cands = wp.array(candidates.astype(np.float32), dtype=wp.vec3, device=DEV)
     scores = wp.zeros(len(candidates), dtype=wp.float32, device=DEV)
     pts = wp.array(scan_local, dtype=wp.vec2, device=DEV)
     wp.launch(
         k_bbs_score,
         dim=len(candidates),
-        inputs=[pts, grid, gx, gy, level_res, H, W, cands, scores],
+        inputs=[pts, grid, submap.gx, submap.gy, RES, H, W, cands, scores],
         device=DEV,
     )
     return scores.numpy()
 
 
-def bbs(
-    submap,
-    scan_local,
-    prior_local,
-    win_xy=BBS_WIN_XY,
-    win_th=BBS_WIN_TH,
-    min_score=LC_MIN_SCORE,
-):
-    """Branch-and-bound search for the best (x,y,theta) match in submap-local frame.
+def bbs(submap, scan_local, prior_local, win_xy, win_th, min_score=LC_MIN_SCORE):
+    """Branch-and-bound search for the best (x, y, theta) match in submap-local frame.
 
-    Returns (best_pose_local, best_score) or (None, 0) if no match exceeds min_score.
+    Returns (best_pose_local, best_score), or (None, 0.0) if no match exceeds min_score.
 
-    Algorithm:
-      1. Generate root candidates: for each angle in dense angular sweep,
-         use coarsest pyramid level, tile (x,y) at that level's cell size.
-      2. Score them all in one batch on GPU.
-      3. Sort descending. DFS: for each candidate above current best,
-         either subdivide (4 finer-resolution sub-cells) or accept (if at
-         finest level).
-      4. The score at coarse levels upper-bounds any descendant, so any
-         candidate below current best is pruned.
+    Algorithm (paper Section V-B):
+      1. Pick angular step from Eq. 7.
+      2. Enumerate angles. For each angle, generate root spatial candidates at
+         the coarsest level's resolution covering the search window.
+      3. DFS with pruning. Each candidate is (x_corner, y_corner, theta, level).
+         At a non-leaf level, the score is an exact upper bound on any leaf in
+         the subtree. Children at a finer level tile the parent's spatial extent
+         (4 children, each at half the spatial extent).
     """
-    if not submap.finalized:
+    if not submap.finalized or len(scan_local) == 0:
         return None, 0.0
 
-    L = BBS_LEVELS - 1  # coarsest level index
-    coarsest_res = RES * (2**L)  # m per coarse cell
+    L = BBS_LEVELS - 1
+    coarsest_res = RES * (2**L)
 
-    # Angular sweep: at the coarsest level, pose ambiguity in theta is bounded
-    # by ~asin(coarsest_res / scan_max_range), but for simplicity we use a
-    # fixed angular step. Cartographer derives this from scan extent.
-    n_th = int(2 * win_th / BBS_STEP_TH) + 1
+    dtheta = _angular_step(scan_local, RES)
+    n_th = int(np.ceil(2 * win_th / dtheta)) + 1
     thetas = np.linspace(prior_local[2] - win_th, prior_local[2] + win_th, n_th)
 
-    # XY candidates at coarsest level: tile at coarsest_res
-    n_xy = int(2 * win_xy / coarsest_res) + 1
-    dxs = (np.arange(n_xy) - n_xy // 2) * coarsest_res
-    xs = prior_local[0] + dxs
-    ys = prior_local[1] + dxs
+    # Spatial candidates at coarsest level: tile [-win_xy, win_xy] symmetrically.
+    # Each candidate (cx, cy) at level L represents poses in [cx, cx + coarsest_res).
+    half_n = int(np.ceil(win_xy / coarsest_res))
+    offsets = (np.arange(2 * half_n + 1) - half_n) * coarsest_res
+    xs = prior_local[0] + offsets
+    ys = prior_local[1] + offsets
 
-    # Build root candidates: (theta, y, x) cartesian product
-    # Each element stores (x, y, theta, level_index, x_index_in_level, y_index_in_level)
+    # Build root candidates and score them in one batch on the coarsest grid.
     root_cands = []
     for th in thetas:
-        for yi, y in enumerate(ys):
-            for xi, x in enumerate(xs):
+        for y in ys:
+            for x in xs:
                 root_cands.append((x, y, wrap(th), L))
-
-    # Score root candidates as a batch
-    cand_xyz = np.array([(c[0], c[1], c[2]) for c in root_cands])
-    if len(cand_xyz) == 0:
+    if not root_cands:
         return None, 0.0
+    cand_xyz = np.array([(c[0], c[1], c[2]) for c in root_cands])
     root_scores = _score_at_level(submap, L, scan_local, cand_xyz)
 
-    # Pair with metadata, sort descending by score
-    indexed = sorted(
-        [(root_scores[i], root_cands[i]) for i in range(len(root_cands))],
-        key=lambda t: -t[0],
-    )
+    # DFS: process highest-scoring candidates first; prune anything below current best.
+    indexed = sorted(zip(root_scores.tolist(), root_cands), key=lambda t: t[0])
+    stack = list(indexed)  # lowest first; .pop() yields highest first
 
-    # DFS with best-first ordering and pruning
     best_score = min_score
     best_pose = None
-    # Use a list as a stack; entries: (score_upper_bound, cand_tuple)
-    stack = [(s, c) for s, c in indexed]
-    # already sorted highest-first; pop from end gives lowest first; we want
-    # highest first so process from the front
-    stack.reverse()  # so .pop() yields highest score
 
     while stack:
         score, cand = stack.pop()
         if score < best_score:
-            continue  # prune: no descendant beats current best
+            continue  # prune: no descendant can beat current best
         x, y, th, lvl = cand
         if lvl == 0:
-            # leaf: accept
+            # Leaf score is the exact match score (1x1 cell window).
             best_score = score
             best_pose = np.array([x, y, th])
             continue
-        # branch: subdivide (x,y) into 4 children at finer level
+        # Branch into 4 children at the next finer level, each covering a quadrant.
         finer_lvl = lvl - 1
         finer_res = RES * (2**finer_lvl)
-        # Each parent cell covers 2x2 finer cells; children sit at the centers
-        # of those finer cells. Parent (x,y) was the corner of a coarse cell;
-        # finer cells offset by 0 or finer_res in each axis.
         children = [
             (x, y, th, finer_lvl),
             (x + finer_res, y, th, finer_lvl),
             (x, y + finer_res, th, finer_lvl),
             (x + finer_res, y + finer_res, th, finer_lvl),
         ]
-        c_xyz = np.array([(c[0], c[1], c[2]) for c in children])
+        c_xyz = np.array([(cc[0], cc[1], cc[2]) for cc in children])
         c_scores = _score_at_level(submap, finer_lvl, scan_local, c_xyz)
-        # Push children, lowest score first so highest is processed next
-        for s, c in sorted(zip(c_scores, children), key=lambda t: t[0]):
+        # Push lowest-score child first so highest is processed next.
+        for s, cc in sorted(zip(c_scores.tolist(), children), key=lambda t: t[0]):
             if s >= best_score:
-                stack.append((s, c))
+                stack.append((s, cc))
 
     if best_pose is None:
         return None, 0.0
@@ -625,10 +682,10 @@ def bbs(
 class PoseGraph:
     """Pose graph with two kinds of nodes: trajectory nodes and submap origins.
 
-    Both are Pose2 variables in GTSAM. We use disjoint integer ID spaces so
-    a single int identifies both kind and index.
-    Trajectory nodes:  IDs 0      .. 999_999
-    Submap origin IDs: IDs 1_000_000 .. 1_999_999
+    Both are Pose2 variables in GTSAM. Disjoint integer ID spaces let one int
+    identify both kind and index.
+      * Trajectory nodes:  IDs 0      .. 999_999
+      * Submap origin IDs: IDs 1_000_000 .. 1_999_999
     """
 
     SUBMAP_ID_OFFSET = 1_000_000
@@ -678,16 +735,7 @@ class PoseGraph:
         )
 
     def optimize(self):
-        """Run Levenberg-Marquardt to global optimum.
-
-        GTSAM internally:
-          1. linearizes every factor at current values, computing analytic
-             SE(2) Jacobians (Grisetti tutorial appendix)
-          2. assembles sparse H = J^T Omega J and b = J^T Omega r
-          3. solves (H + lambda*I) dx = -b via sparse Cholesky (CHOLMOD)
-          4. retracts: T_i <- T_i [+] dx_i, with theta wrapped
-          5. accepts/rejects per LM rule, updates lambda, iterates
-        """
+        """Run Levenberg-Marquardt to global optimum (paper Eq. SPA)."""
         opt = gtsam.LevenbergMarquardtOptimizer(self.graph, self.values)
         self.values = opt.optimize()
 
@@ -697,31 +745,39 @@ class PoseGraph:
 
 
 # =============================================================================
-# SubmapStack: manages collection of submaps with two-active rotation
+# SubmapStack: two-active rotation, each submap receives 2*N scans.
 # =============================================================================
 class SubmapStack:
+    """Manages the rotation of active submaps.
+
+    Following Cartographer 2D: each submap receives 2 * NUM_RANGE_DATA scans.
+    A new submap is started every NUM_RANGE_DATA scans, so two submaps are always
+    active simultaneously -- one acting as the "old" matching target (already has
+    NUM_RANGE_DATA scans of context), one accumulating as the "new" submap.
+    """
+
     def __init__(self):
-        self.submaps = []  # list of Submap, in creation order
+        self.submaps = []
 
     def all_active(self):
         return [s for s in self.submaps if not s.finalized]
 
     def matching_target(self):
-        """Older active submap is the matching target -- has more accumulated data."""
+        """The older active submap is the matching target (more accumulated data)."""
         active = self.all_active()
         return active[0] if active else None
 
     def add_scan(self, sensor_pose_world, scan_local):
-        """Insert into all active submaps. Returns list of submap IDs that received this scan.
+        """Insert into all active submaps. Returns list of submap IDs touched.
         May trigger finalization of the older active submap.
         """
         active = self.all_active()
-        # If no active submap, or the only active one is past half-full, start a new one
         if not active:
             new = Submap(sensor_pose_world)
             self.submaps.append(new)
             active = [new]
-        elif len(active) == 1 and active[0].n >= SUBMAP_N // 2:
+        elif len(active) == 1 and active[0].n >= NUM_RANGE_DATA:
+            # The older submap is "halfway through": time to start the next one.
             new = Submap(sensor_pose_world)
             self.submaps.append(new)
             active.append(new)
@@ -731,9 +787,8 @@ class SubmapStack:
             sm.insert(sensor_pose_world, scan_local)
             ids.append(sm.id)
 
-        # Finalize the older active submap if it's full
         older = active[0]
-        if older.n >= SUBMAP_N:
+        if older.n >= SUBMAP_TOTAL_SCANS:
             older.finalize()
         return ids
 
@@ -755,13 +810,15 @@ class Slam:
         self.graph = PoseGraph()
         self.last_pose = np.zeros(3)
         self.scans_since_optimize = 0
-        # Map: submap.id -> graph_key for its origin
+        # submap_id -> graph_key for its origin
         self.submap_keys = {}
-        # Map: graph_key for trajectory node -> (containing submap id, scan_local, sensor_pose_world)
+        # node_key -> {"submap_ids": [...], "scan": Nx2}
         self.traj_meta = {}
+        # Tracks (node_key, submap_id) pairs already attempted for LC and rejected.
+        # Cleared after each optimization since poses (and gating) change.
+        self._lc_attempted = set()
 
     def _ensure_submap_in_graph(self, submap):
-        """Make sure this submap has an origin node in the pose graph."""
         if submap.id not in self.submap_keys:
             key = self.graph.add_submap_origin(submap.origin)
             self.submap_keys[submap.id] = key
@@ -769,27 +826,30 @@ class Slam:
 
     def add_scan(self, scan_local, odom_delta):
         """Process one scan. Returns the (possibly post-optimization) world pose."""
+        # Empty scan: nothing to match against; just propagate the prior.
+        if len(scan_local) == 0:
+            self.last_pose = compose(self.last_pose, odom_delta)
+            return self.last_pose.copy()
+
         # 1. Motion prior in world frame
         prior_world = compose(self.last_pose, odom_delta)
 
         # 2. Match against current matching target
         target = self.stack.matching_target()
         if target is None or target.n < 2:
-            # No data yet -- just accept the prior, low confidence
+            # No data yet -- just accept the prior.
             matched_world = prior_world
-            score = 0.0
         else:
-            # Convert prior to submap-local frame
             prior_local = between(target.origin, prior_world)
-            csm_local, score = csm(target, prior_local, scan_local)
-            if score > 0.3:
-                refined_local = refine(target, csm_local, prior_local, scan_local)
-                matched_world = compose(target.origin, refined_local)
+            if USE_CSM:
+                csm_local, score = csm(target, prior_local, scan_local)
+                init_local = csm_local if score > CSM_MIN_SCORE else prior_local
             else:
-                # matcher unconfident -- trust the prior
-                matched_world = prior_world
+                init_local = prior_local
+            refined_local = refine_local(target, init_local, prior_local, scan_local)
+            matched_world = compose(target.origin, refined_local)
 
-        # 3. Insert into submaps (may finalize the older submap)
+        # 3. Insert into all active submaps (may finalize the older submap)
         submap_ids = self.stack.add_scan(matched_world, scan_local)
 
         # 4. Add trajectory node and intra-submap edges
@@ -797,7 +857,6 @@ class Slam:
         self.traj_meta[node_key] = {
             "submap_ids": list(submap_ids),
             "scan": scan_local.copy(),
-            "sensor_pose_world": matched_world.copy(),
         }
         for sid in submap_ids:
             sm = next(s for s in self.stack.submaps if s.id == sid)
@@ -807,54 +866,74 @@ class Slam:
 
         self.scans_since_optimize += 1
 
-        # 5. Loop closure: every OPTIMIZE_EVERY scans, search for closures
-        lc_added = False
+        # 5. Periodic loop-closure sweep + global optimization.
         if self.scans_since_optimize >= OPTIMIZE_EVERY and node_key > LC_SKIP_NODES:
-            lc_added = self._try_loop_closures(node_key, matched_world, scan_local)
+            n_added = self._sweep_loop_closures(node_key)
             self.scans_since_optimize = 0
-
-        if lc_added:
-            self.graph.optimize()
-            # refresh: pull updated pose for current node, update submap origins
-            matched_world = self.graph.pose(node_key)
-            for sid, sk in self.submap_keys.items():
-                sm = next(s for s in self.stack.submaps if s.id == sid)
-                sm.origin = self.graph.pose(sk)
+            if n_added > 0:
+                self.graph.optimize()
+                # Refresh submap origins and current pose from the optimization.
+                for sid, sk in self.submap_keys.items():
+                    sm = next(s for s in self.stack.submaps if s.id == sid)
+                    sm.origin = self.graph.pose(sk)
+                matched_world = self.graph.pose(node_key)
+                # Optimization moves poses; previously rejected pairs may now
+                # pass spatial gating, so clear the rejection cache.
+                self._lc_attempted.clear()
 
         self.last_pose = matched_world
         return matched_world
 
-    def _try_loop_closures(self, node_key, node_pose_world, scan_local):
-        """For each finalized submap not adjacent to this node, run BBS.
-        Add a loop-closure edge for each successful match.
+    def _sweep_loop_closures(self, current_node_key):
+        """Test (recent_node, finalized_submap) pairs that pass spatial gating.
+
+        Trying a window of recent nodes (not just the current one) approximates
+        Cartographer's background dispatch: nodes get re-tried after optimization
+        has shifted their world poses, and a node that just missed the gating
+        cutoff before may pass after a closure tightens the trajectory.
         """
-        added = False
-        current_submap_ids = set(self.traj_meta[node_key]["submap_ids"])
-        for sm in self.stack.submaps:
-            if not sm.finalized:
+        node_keys = sorted(self.traj_meta.keys())
+        recent = node_keys[-LC_RECENT_WINDOW:]
+        if current_node_key not in recent:
+            recent.append(current_node_key)
+
+        added = 0
+        for nk in recent:
+            if nk <= LC_SKIP_NODES:
                 continue
-            if sm.id in current_submap_ids:
-                continue
-            # spatial gating: skip submaps far from current pose
-            d = np.linalg.norm(sm.origin[:2] - node_pose_world[:2])
-            if d > BBS_WIN_XY:
-                continue
-            # BBS starting from current best estimate of the node in submap-local frame
-            prior_local = between(sm.origin, node_pose_world)
-            best, score = bbs(
-                sm,
-                scan_local,
-                prior_local,
-                win_xy=2.0,
-                win_th=0.5,
-                min_score=LC_MIN_SCORE,
-            )
-            if best is None:
-                continue
-            # Refine the BBS hit to sub-grid accuracy
-            refined = refine(sm, best, prior_local, scan_local)
-            self.graph.add_loop_closure(self.submap_keys[sm.id], node_key, refined)
-            added = True
+            node_pose = self.graph.pose(nk)
+            scan_local = self.traj_meta[nk]["scan"]
+            node_submap_ids = set(self.traj_meta[nk]["submap_ids"])
+            for sm in self.stack.submaps:
+                if not sm.finalized:
+                    continue
+                if sm.id in node_submap_ids:
+                    continue
+                pair = (nk, sm.id)
+                if pair in self._lc_attempted:
+                    continue
+                # Spatial gating
+                d = np.linalg.norm(sm.origin[:2] - node_pose[:2])
+                if d > LC_MAX_DISTANCE:
+                    self._lc_attempted.add(pair)
+                    continue
+                prior_local = between(sm.origin, node_pose)
+                best, score = bbs(
+                    sm,
+                    scan_local,
+                    prior_local,
+                    win_xy=LC_WIN_XY,
+                    win_th=LC_WIN_TH,
+                    min_score=LC_MIN_SCORE,
+                )
+                if best is None:
+                    self._lc_attempted.add(pair)
+                    continue
+                # Refine the BBS hit WITHOUT odometry prior -- LC must override drift.
+                refined = refine_lc(sm, best, scan_local)
+                self.graph.add_loop_closure(self.submap_keys[sm.id], nk, refined)
+                added += 1
+                # Don't add to _lc_attempted: pair may be revisited if poses shift.
         return added
 
     def current_pose(self):
@@ -862,16 +941,13 @@ class Slam:
 
     def snapshot(self):
         """Return a dict suitable for visualization."""
+        out_submaps = []
+        for s in self.stack.submaps:
+            if not s.finalized:
+                s.refresh_prob()
+            out_submaps.append((s.id, s.origin.copy(), s.finalized, s.prob.numpy()))
         return {
-            "submaps": [
-                (
-                    s.id,
-                    s.origin.copy(),
-                    s.finalized,
-                    s.log.numpy() if not s.finalized else s.prob.numpy(),
-                )
-                for s in self.stack.submaps
-            ],
+            "submaps": out_submaps,
             "trajectory": [self.graph.pose(k) for k in sorted(self.traj_meta.keys())],
         }
 
@@ -880,16 +956,11 @@ class Slam:
 # Smoke test
 # =============================================================================
 if __name__ == "__main__":
-    # Minimal integration check: import + instantiate + run a few steps with
-    # a simple synthetic scan. For real validation use test_e2e.py.
     print(f"Warp device: {DEV}")
     print(f"Submap size: {GRID_HW}x{GRID_HW} @ {RES}m/cell ({GRID_HW * RES}m)")
-    print(
-        f"CSM candidates: {(2 * int(WIN_XY / STEP_XY) + 1) ** 2 * (2 * int(WIN_TH / STEP_TH) + 1)}"
-    )
-    print(
-        f"BBS pyramid: {BBS_LEVELS} levels (coarsest cell {RES * 2 ** (BBS_LEVELS - 1)}m)"
-    )
+    print(f"Submap budget: {SUBMAP_TOTAL_SCANS} scans (Cartographer 2*num_range_data)")
+    print(f"BBS pyramid: {BBS_LEVELS} levels, same-resolution sliding-window max")
+    print(f"Use CSM (real-time correlative): {USE_CSM}")
 
     slam = Slam()
     rng = np.random.default_rng(0)
@@ -904,7 +975,6 @@ if __name__ == "__main__":
     for step in range(5):
         delta = np.array([0.1, 0.0, 0.1])
         pose = compose(pose, delta)
-        # crude scan from these wall points
         c, s = np.cos(pose[2]), np.sin(pose[2])
         rel = (walls_pts - pose[:2]) @ np.array([[c, s], [-s, c]]).T
         rng_ = np.linalg.norm(rel, axis=1)
