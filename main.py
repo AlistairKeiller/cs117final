@@ -337,6 +337,31 @@ def _make_sample_fn(submap):
         )
     return sample
 
+def _refine(submap, init_pose_local, scan_local, prior_local):
+    if len(scan_local) == 0:
+        return init_pose_local.copy()
+    sample = _make_sample_fn(submap)
+
+    def residual(T):
+        c, s = np.cos(T[2]), np.sin(T[2])
+        wx = T[0] + c * scan_local[:, 0] - s * scan_local[:, 1]
+        wy = T[1] + s * scan_local[:, 0] + c * scan_local[:, 1]
+        m = sample(np.column_stack([wx, wy]))
+        rp = 1.0 - m
+        if prior_local is None:
+            return rp
+        rt_x = REFINE_W_T * (T[0] - prior_local[0])
+        rt_y = REFINE_W_T * (T[1] - prior_local[1])
+        rr = REFINE_W_R * wrap(T[2] - prior_local[2])
+        return np.concatenate([rp, [rt_x, rt_y, rr]])
+    res = least_squares(
+        residuals, init_pose_local.copy(), method="lm",
+        max_nfev=REFINE_ITRS * 4
+    )
+    out = res.x.copy()
+    out[2] = wrap(out[2])
+    return out
+
 def refine_local(submap, init_pose_local, prior_local, scan_local):
     return _refine(submap, init_pose_local, scan_local, prior_local=prior_local)
 
