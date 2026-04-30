@@ -3,7 +3,9 @@ name = "cs117-final"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
+    "gtsam>=4.2",
+    "scipy>=1.17.1",
     "warp-lang>=1.12.1",
 ]

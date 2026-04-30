@@ -1,28 +1,45 @@
+import gtsam
+import numpy as np
 import warp as wp
+from scipy.ndimage import map_coordinates, spline_filter
+from scipy.optimize import least_squares
+
+RES = 0.05  # m / cell
+L_HIT, L_MISS = 0.85, -0.40
+L_MIN, L_MAX = -2.2, 2.2
+GRID_HW = 400  # 20m x 20m submap
+
+USE_CSM = False # off by default; enable if odometry is unreliable
+CSM_WIN_XY, CSM_STEP_XY = 0.15, 0.025
+CSM_WIN_TH, CSM_STEP_TH = 0.17, 0.005
+CSM_MIN_SCORE = 0.30 # below this, fall back to odometry-only init for refinement
+
+wp.init()
+DEVICE = "cuda" if wp.is_cuda_available() else "cpu"
 
 
-@wp.func
-def wrap(theta: wp.float):
-    return (theta + wp.pi) % (2 * wp.pi) - wp.pi
+def wrap(theta: np.float32):
+    return (theta + np.pi) % (2 * np.pi) - np.pi
 
 
-@wp.func
-def compose(a: wp.vec3f, b: wp.vec3f):
-    c, s = wp.cos(a.z), wp.sin(a.z)
-    return wp.vec3(a.x + c * b.x - s * b.y, a.y + s * b.x + c * b.y, wrap(a.z + b.z))
+def compose(a: np.ndarray, b: np.ndarray):
+    c, s = np.cos(a[2]), np.sin(a[2])
+    return np.array(
+        (a[0] + c * b[0] - s * b[1], a[1] + s * b[0] + c * b[1], wrap(a[2] + b[2]))
+    )
 
 
-@wp.func
-def inverse(a: wp.vec3f):
-    c, s = wp.cos(a.z), wp.sin(a.z)
-    return wp.vec3(-c * a.x - s * a.y, s * a.x - c * a.y, -a.z)
+def inverse(a: np.ndarray):
+    c, s = np.cos(a[2]), np.sin(a[2])
+    return np.array((-c * a[0] - s * a[1], s * a[0] - c * a[1], -a[2]))
 
 
-@wp.func
-def between(a: wp.vec3f, b: wp.vec3f):
-    c, s = wp.cos(a.z), wp.sin(a.z)
-    delta = wp.vec3(b.x - a.x, b.y - a.y, b.z - a.z)
-    return wp.vec3(c * delta.x + s * delta.y, -s * delta.x + c * delta.y, wrap(delta.z))
+def between(a: np.ndarray, b: np.ndarray):
+    c, s = np.cos(a[2]), np.sin(a[2])
+    delta = np.array([b[0] - a[0], b[1] - a[1], b[2] - a[2]])
+    return np.array(
+        (c * delta[0] + s * delta[1], -s * delta[0] + c * delta[1], wrap(delta[2]))
+    )
 
 
 @wp.kernel
@@ -105,7 +122,7 @@ def k_csm(
     nth: wp.int,
     sxy: wp.float,
     sth: wp.float,
-    scores: wp.array3d[wp.float32],
+    scores: wp.array3d[wp.float],
 ):
     it, iy, ix = wp.tid()
     dth = (wp.float(it) - wp.float(nth) / 2.0) * sth
@@ -184,15 +201,145 @@ def k_bbs_score(
     scores[k] = acc / wp.float(n)
 
 
-class SubmapStack:
+class Submap:
     def __init__(self):
-        self.submaps = []
+        self.id = Submap._next_id()
+        Submap._next_id += 1
+        self.origin = origin_pose.copy()
+        self.gx = -GRID_HW * RES / 2.0
+        self.gy = -GRID_HW * RES / 2.0
+        self.log = wp.zeros((GRID_HW, GRID_HW), dtype=wp.float, device=DEVICE)
+        self.prob = wp.zeros((GRID_HW, GRID_HW), dtype=wp.float, device=DEVICE)
+        self.precomp = []
+        self.scan = []
+        self.n = 0
+        self.finalized = False
+        self._prob_dirty = True
 
-    def all_active(self):
-        return [s for s in self.submaps if not s.finalized]
+    def insert(self, sensor_pose_world, scan_local):
+        if self.finalized:
+            raise RuntimeError("Cannot insert into finalized submap")
+        if len(scan_local) == 0:
+            return
 
-    def add_scan(self, sensor_pose_world, scan_local):
-        active = self.all_active()
+        sensor_local = between(self.origin, sensor_pose_world)
+        c, s = np.cos(sensor_local[2]), np.sin(sensor_local[2])
+        R = np.array([[c, -s], [s, c]])
+        scan_submap = scan_local @ R.T + sensor_local[:2]
+        pts = wp.array(scan_submap, dtype=wp.vec2f, device=DEVICE)
+        wp.launch(
+            k_cast,
+            dim=len(scan_submap),
+            inputs=[
+                pts,
+                wp.vec2f(sensor_local[0], sensor_local[1]),
+                self.log,
+                self.gx,
+                self.gy,
+                RES,
+                L_HIT,
+                L_MISS,
+                GRID_HW,
+                GRID_HW,
+            ],
+        )
+        wp.launch(
+            k_clamp,
+            dim=(GRID_HW, GRID_HW),
+            inputs=[self.log, L_MIN, L_MAX],
+            device=DEVICE,
+        )
+        self.scan.append(pts)
+        self.n += 1
+        self._prob_dirty = True
+
+    def refresh_probs(self):
+        if self._prob_dirty:
+            wp.launch(
+                k_logodds_to_prob,
+                dim=(GRID_HW, GRID_HW),
+                inputs=[self.log, self.prob],
+                device=DEVICE,
+            )
+            self._prob_dirty = False
+
+    def finalize(self):
+        if self.finalized:
+            return
+        self.refresh_prob()
+        self.precomp = [self.prob]
+        for h in range(1, BBS_LEVELS):
+            prev = self.precomp[-1]
+            offset = 2 ** (h - 1)
+            nxt = wp.zeros((GRID_HW, GRID _HW), dtype=wp.float, device=DEVICE)
+            wp.launch(
+                k_pyramid_step,
+                dim=(GRID_HW, GRID_HW),
+                inputs=[prev, nxt, offset, GRID_HW, GRID_HW],
+                device=DEVICE
+            )
+            self.precomp.append(nxt)
+        self.finalized = True
+        self.log = None
+
+def csm(submap, prior_local, scan_local):
+    if len(scan_local) == 0:
+        return prior_local.copy(), 0.0
+    submap.refresh_probs()
+    nx = wp.int(2 * CSM_WIN_XY / CSM_STEP_XY) + 1
+    ny = nx
+    nth = wp.int(2 * CSM_WIN_TH / CSM_STEP_TH) + 1
+
+    pts = wp.array(scan_local, dtype=wp.vec2, device=DEVICE)
+    scores = wp.zeros((nth, ny, nx), dtype=wp.float32, device=DEVICE)
+    wp.launch(
+        k_csm,
+        dim=(nth, ny, nx),
+        inputs=[
+            pts,
+            submap.prob,
+            submap.gx,
+            submap.gy,
+            RES,
+            GRID_HW,
+            GRID_HW,
+            wp.float(prior_local[0]),
+            wp.float(prior_local[1]),
+            wp.float(prior_local[2]),
+            nx,
+            ny,
+            nth,
+            CSM_STEP_XY,
+            CSM_STEP_TH,
+            scores
+        ]
+    )
+    s = scores.numpy()
+    it, iy, ix = np.unravel_index(int(np.argmax(s)), s.shape)
+    dth = (it - nth // 2) * CSM_STEP_TH
+    dx = (ix - nx // 2) * CSM_STEP_XY
+    dy = (iy - ny // 2) * CSM_STEP_XY
+    best = np.array(
+        (prior_local[0] + dx, prior_local[1] + dy, wrap(prior_local[2] + dth))
+    )
+    return best, s[it, iy, ix]
+
+def _make_sample_fn(submap):
+    submap.refresh_probs()
+    prob = submap.prob.numpy()
+    filtered = spline_filter(prob, mode="constant")
+    def sample(world_xy):
+        fx = (world_xy[:, 0] - submap.gx) / RES - 0.5
+        fy = (world_xy[:, 1] - submap.gy) / RES - 0.5
+        coords = np.vstack([fy, fx])
+        return map_coordinates(
+            filtered, coords, cval=0.5, prefilter=False
+        )
+    return sample
+
+def refine_local(submap, init_pose_local, prior_local, scan_local):
+    return _refine(submap, init_pose_local, scan_local, prior_local=prior_local)
+
 
 
 def main():
