@@ -1,0 +1,9 @@
+[project]
+name = "cs117-final"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "warp-lang>=1.12.1",
+]
