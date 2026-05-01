@@ -447,6 +447,15 @@ def bbs(submap, scan_local, prior_local, win_xy, win_th):
         return None, 0.0
     return best_pose, best_score
 
+class PoseGraph:
+    SUBMAP_ID_OFFSET = 1_000_000
+
+    def __init__(self):
+        self.graph = gtsam.NonlinearFactorGraph()
+        self.valuse = gtsam.Values()
+        self._next_traj = 0
+        self._next_submap = 0
+        self._intra_noise =
 
 
 def main():
