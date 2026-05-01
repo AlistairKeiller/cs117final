@@ -1,3 +1,4 @@
+# pyright: reportIndexIssue=false, reportArgumentType=false
 import gtsam
 import numpy as np
 import warp as wp
@@ -14,8 +15,14 @@ CSM_WIN_XY, CSM_STEP_XY = 0.15, 0.025
 CSM_WIN_TH, CSM_STEP_TH = 0.17, 0.005
 CSM_MIN_SCORE = 0.30 # below this, fall back to odometry-only init for refinement
 
+BBS_LEVELS = 6  # precomputed grid levels (covers 2^5 = 32 cells = 1.6m windowing)
+LC_MIN_SCORE = 0.55
+LC_WIN_XY = 2.0  # m, half-window for local LC search
+LC_WIN_TH = 0.5  # rad, half-window for local LC search
+LC_MAX_DISTANCE = 15.0  # m, spatial gating
+
 wp.init()
-DEVICE = "cuda" if wp.is_cuda_available() else "cpu"
+DEV = "cuda" if wp.is_cuda_available() else "cpu"
 
 
 def wrap(theta: np.float32):
@@ -47,13 +54,13 @@ def k_cast(
     pts: wp.array[wp.vec2],
     origin: wp.vec2,
     grid: wp.array2d,
-    gx: float,
-    gy: float,
-    r: float,
-    l_hit: float,
-    l_miss: float,
-    H: int,
-    W: int,
+    gx: wp.float,
+    gy: wp.float,
+    res: wp.float,
+    l_hit: wp.float,
+    l_miss: wp.float,
+    H: wp.int,
+    W: wp.int,
 ):
     i = wp.tid()
     p = pts[i]
@@ -95,19 +102,19 @@ def k_cast(
 
 @wp.kernel
 def k_clamp(grid: wp.array2d, lo: float, high: float):
-    i, j = wp.tid()
+    i, j = wp.tid()  # pyright: ignore[reportAssignmentType, reportGeneralTypeIssues]
     grid[i, j] = wp.clamp(grid[i, j], lo, high)
 
 
 @wp.kernel
 def k_logodds_to_prob(lo: wp.array2d[wp.float], pr: wp.array2d[wp.float]):
-    i, j = wp.tid()
+    i, j = wp.tid()  # pyright: ignore[reportAssignmentType, reportGeneralTypeIssues]
     pr[i, j] = 1.0 / (1.0 + wp.exp(-lo[i, j]))
 
 
 @wp.kernel
 def k_csm(
-    pts: wp.array[wp.vec2f],
+    pts: wp.array[wp.vec2],
     grid: wp.array2d[wp.float],
     gx: wp.float,
     gy: wp.float,
@@ -124,7 +131,7 @@ def k_csm(
     sth: wp.float,
     scores: wp.array3d[wp.float],
 ):
-    it, iy, ix = wp.tid()
+    it, iy, ix = wp.tid()  # pyright: ignore[reportAssignmentType, reportGeneralTypeIssues]
     dth = (wp.float(it) - wp.float(nth) / 2.0) * sth
     dx = (wp.float(ix) - wp.float(nx) / 2.0) * sxy
     dy = (wp.float(iy) - wp.float(ny) / 2.0) * sxy
@@ -136,8 +143,8 @@ def k_csm(
     acc = 0.0
     for k in range(n):
         p = pts[k]
-        wx = cx + c * p.x - s * p.y
-        wy = cy + s * p.x + c * p.y
+        wx = cx + c * p[0] - s * p[1]
+        wy = cy + s * p[0] + c * p[1]
         fx = (wx - gx) / res - 0.5
         fy = (wy - gy) / res - 0.5
         x0 = wp.int(wp.floor(fx))
@@ -159,7 +166,7 @@ def k_pyramid_step(
     H: wp.int,
     W: wp.int,
 ):
-    i, j = wp.tid()
+    i, j = wp.tid()  # pyright: ignore[reportAssignmentType, reportGeneralTypeIssues]
     a = src[i, j]
     b = src[i + offset, j] if i + offset < H else 0.0
     c = src[i, j + offset] if j + offset < W else 0.0
@@ -172,14 +179,14 @@ def k_pyramid_step(
 
 @wp.kernel
 def k_bbs_score(
-    pts: wp.array[wp.vec2f],
+    pts: wp.array[wp.vec2],
     grid: wp.array2d[wp.float],
     gx: float,
     gy: float,
     res: float,
     H: int,
     W: int,
-    cands: wp.array[wp.vec3f],
+    cands: wp.array[wp.vec3],
     scores: wp.array[wp.float],
 ):
     k = wp.tid()
@@ -202,14 +209,14 @@ def k_bbs_score(
 
 
 class Submap:
-    def __init__(self):
+    def __init__(self, origin_pose):
         self.id = Submap._next_id()
         Submap._next_id += 1
         self.origin = origin_pose.copy()
         self.gx = -GRID_HW * RES / 2.0
         self.gy = -GRID_HW * RES / 2.0
-        self.log = wp.zeros((GRID_HW, GRID_HW), dtype=wp.float, device=DEVICE)
-        self.prob = wp.zeros((GRID_HW, GRID_HW), dtype=wp.float, device=DEVICE)
+        self.log = wp.zeros((GRID_HW, GRID_HW), dtype=wp.float, device=DEV)
+        self.prob = wp.zeros((GRID_HW, GRID_HW), dtype=wp.float, device=DEV)
         self.precomp = []
         self.scan = []
         self.n = 0
@@ -226,13 +233,13 @@ class Submap:
         c, s = np.cos(sensor_local[2]), np.sin(sensor_local[2])
         R = np.array([[c, -s], [s, c]])
         scan_submap = scan_local @ R.T + sensor_local[:2]
-        pts = wp.array(scan_submap, dtype=wp.vec2f, device=DEVICE)
+        pts = wp.array(scan_submap, dtype=wp.vec2, device=DEV)
         wp.launch(
             k_cast,
             dim=len(scan_submap),
             inputs=[
                 pts,
-                wp.vec2f(sensor_local[0], sensor_local[1]),
+                wp.vec2(sensor_local[0], sensor_local[1]),
                 self.log,
                 self.gx,
                 self.gy,
@@ -247,7 +254,7 @@ class Submap:
             k_clamp,
             dim=(GRID_HW, GRID_HW),
             inputs=[self.log, L_MIN, L_MAX],
-            device=DEVICE,
+            device=DEV,
         )
         self.scan.append(pts)
         self.n += 1
@@ -259,14 +266,14 @@ class Submap:
                 k_logodds_to_prob,
                 dim=(GRID_HW, GRID_HW),
                 inputs=[self.log, self.prob],
-                device=DEVICE,
+                device=DEV,
             )
             self._prob_dirty = False
 
     def finalize(self):
         if self.finalized:
             return
-        self.refresh_prob()
+        self.refresh_probs()
         self.precomp = [self.prob]
         for h in range(1, BBS_LEVELS):
             prev = self.precomp[-1]
@@ -276,7 +283,7 @@ class Submap:
                 k_pyramid_step,
                 dim=(GRID_HW, GRID_HW),
                 inputs=[prev, nxt, offset, GRID_HW, GRID_HW],
-                device=DEVICE
+                device=DEV
             )
             self.precomp.append(nxt)
         self.finalized = True
@@ -290,8 +297,8 @@ def csm(submap, prior_local, scan_local):
     ny = nx
     nth = wp.int(2 * CSM_WIN_TH / CSM_STEP_TH) + 1
 
-    pts = wp.array(scan_local, dtype=wp.vec2, device=DEVICE)
-    scores = wp.zeros((nth, ny, nx), dtype=wp.float32, device=DEVICE)
+    pts = wp.array(scan_local, dtype=wp.vec2, device=DEV)
+    scores = wp.zeros((nth, ny, nx), dtype=wp.float32, device=DEV)
     wp.launch(
         k_csm,
         dim=(nth, ny, nx),
@@ -337,7 +344,7 @@ def _make_sample_fn(submap):
         )
     return sample
 
-def _refine(submap, init_pose_local, scan_local, prior_local):
+def refine(submap, init_pose_local, scan_local, prior_local):
     if len(scan_local) == 0:
         return init_pose_local.copy()
     sample = _make_sample_fn(submap)
@@ -362,8 +369,83 @@ def _refine(submap, init_pose_local, scan_local, prior_local):
     out[2] = wrap(out[2])
     return out
 
-def refine_local(submap, init_pose_local, prior_local, scan_local):
-    return _refine(submap, init_pose_local, scan_local, prior_local=prior_local)
+def _angular_step(scan_local, res):
+    if len(scan_local) == 0:
+        return 0.01
+    d_max = float(np.linalg.norm(scan_local, aixs=1).max())
+    if d_max < 2 * res:
+        return 0.1
+    cos_arg = max(-1.0, 1.0 - res * res / (2.0 * d_max * d_max))
+    return float(np.arccos(cos_arg))
+
+def _score_at_level(submap: Submap, level_idx, scan_local, candidates):
+    grid = submap.precomp[level_idx]
+    H, W = grid.shape
+    cands = wp.array(candidates.astype(np.float32), dtype=wp.vec3, device=DEV)
+    scores = wp.zeros(len(candidates), dtype=wp.float32, device=DEV)
+    pts = wp.array(scan_local, dtype=wp.vec2, device=DEV)
+    wp.launch(
+        k_bbs_score,
+        dim=len(candidates),
+        inputs=[pts, grid, submap.gx, submap.gy, RES, H , W, cands, scores],
+        device=DEV
+    )
+    return scores.numpy()
+
+def bbs(submap, scan_local, prior_local, win_xy, win_th):
+    if not submap.finalized or len(scan_local) == 0:
+        return None, 0.0
+
+    L = BBS_LEVELS - 1
+    coarsest_res = RES * (2**L)
+
+    dtheta = _angular_step(scan_local, RES)
+    n_th = int(np.ceil(2 * win_th / dtheta)) + 1
+    thetas = np.linspace(prior_local[2] - win_th, prior_local[2] + win_th, n_th)
+
+    half_n = int(np.ceil(win_xy / coarsest_res))
+    offsets = (np.arange(2 * half_n+1) - half_n) * coarsest_res
+    xs = prior_local[0] + offsets
+    ys = prior_local[1] + offsets
+
+    root_cands = [(x, y, wrap(theta), L) for x in xs for y in ys for theta in thetas]
+    if not root_cands:
+        return None, 0.0
+    cand_xyz = np.array([(c[0], c[1], c[2]) for c in root_cands])
+    root_scores = _score_at_level(submap, L, scan_local, cand_xyz)
+
+    indexed = sorted(zip(root_scores.tolist(), root_cands), key=lambda t: t[0])
+    stack = list(indexed)
+
+    best_score = LC_MIN_SCORE
+    best_pose = None
+
+    while stack:
+        score, cand = stack.pop()
+        if score < best_score:
+            continue
+        x, y, th, lvl = cand
+        if lvl == 0:
+            best_score = score
+            best_pose = np.array([x, y, th])
+            continue
+        finer_lvl = lvl - 1
+        finer_res = RES * (2**finer_lvl)
+        children = [
+            (x, y, th, finer_lvl),
+            (x + finer_res, y, th, finer_lvl),
+            (x, y + finer_res, th, finer_lvl),
+            (x + finer_res, y + finer_res, th, finer_lvl)
+        ]
+        c_xyz = np.array([(cc[0], cc[1], cc[2]) for cc in  children])
+        c_scores = _score_at_level(submap, finer_lvl, scan_local, c_xyz)
+        for s, cc in sorted(zip(c_scores.tolist(), children), key=lambda t: t[0]):
+            if s >= best_score:
+                stack.append((s, cc))
+
+    if best_pose is None:
+        return None, 0.0
+    return best_pose, best_score
 
 
 
