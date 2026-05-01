@@ -455,7 +455,6 @@ class PoseGraph:
         self.valuse = gtsam.Values()
         self._next_traj = 0
         self._next_submap = 0
-        self._intra_noise =
 
 
 def main():
