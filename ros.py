@@ -20,7 +20,7 @@ class SlamNode(Node):
         self.prev_odom = None
         self.tf = TransformBroadcaster(self)
         self.pub = self.create_publisher(PoseStamped, "/slam_pose", 10)
-        self.create_subscription(Odometry, "/ego_racecar/odom", self.on_odom, 50)
+        self.create_subscription(Odometry, "/odom", self.on_odom, 50)
         self.create_subscription(LaserScan, "/scan", self.on_scan, 10)
         self.odom = None
 
