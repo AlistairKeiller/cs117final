@@ -632,6 +632,7 @@ class SubmapStack:
 
 class Slam:
     MIN_SCANS_FOR_MATCHING = 5
+    MAX_LC_PER_SWEEP = 4
 
     def __init__(self):
         self.stack = SubmapStack()
@@ -644,6 +645,7 @@ class Slam:
         self.traj_meta = {}
         self._lc_attempted = set()
         self._lc_found = set()
+        self._local_to_global = np.zeros(3)
 
     def _ensure_submap_key(self, submap):
         if submap.id not in self.submap_keys:
@@ -687,6 +689,7 @@ class Slam:
         self.traj_meta[node_key] = {
             "submap_ids": list(submap_ids),
             "scan": scan_local.copy(),
+            "local_pose": matched_world.copy(),
         }
         for sid in submap_ids:
             sm = self.stack.by_id(sid)
@@ -698,10 +701,10 @@ class Slam:
         if self.scans_since_optimize >= OPTIMIZE_EVERY and node_key > LC_SKIP_NODES:
             if self._sweep_loop_closures(node_key) > 0:
                 self.graph.optimize()
-                for sid, sk in self.submap_keys.items():
-                    self.stack.by_id(sid).origin = self.graph.pose(sk)
-                matched_world = self.graph.pose(node_key)
-                self.last_pose = matched_world
+                self._local_to_global = compose(
+                    self.graph.pose(node_key),
+                    inverse(self.traj_meta[node_key]["local_pose"]),
+                )
                 self._lc_attempted.clear()
             self.scans_since_optimize = 0
 
@@ -713,7 +716,7 @@ class Slam:
             recent.append(current_node_key)
         added = 0
         for nk in recent:
-            if nk <= LC_SKIP_NODES:
+            if nk <= LC_SKIP_NODES or added >= self.MAX_LC_PER_SWEEP:
                 continue
             node_pose = self.graph.pose(nk)
             lc_scan = adaptive_voxel_filter(
@@ -726,11 +729,12 @@ class Slam:
                 pair = (nk, sm.id)
                 if pair in self._lc_found or pair in self._lc_attempted:
                     continue
-                if np.linalg.norm(sm.origin[:2] - node_pose[:2]) > LC_MAX_DISTANCE:
+                sm_pose = self.graph.pose(self.submap_keys[sm.id])  # CHANGED
+                if np.linalg.norm(sm_pose[:2] - node_pose[:2]) > LC_MAX_DISTANCE:
                     self._lc_attempted.add(pair)
                     continue
                 best, _ = bbs(
-                    sm, lc_scan, between(sm.origin, node_pose), LC_WIN_XY, LC_WIN_TH
+                    sm, lc_scan, between(sm_pose, node_pose), LC_WIN_XY, LC_WIN_TH
                 )
                 if best is None:
                     self._lc_attempted.add(pair)
@@ -740,6 +744,8 @@ class Slam:
                 )
                 self._lc_found.add(pair)
                 added += 1
+                if added >= self.MAX_LC_PER_SWEEP:
+                    break
         return added
 
     def current_pose(self):
